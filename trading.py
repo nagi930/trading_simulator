@@ -1,15 +1,24 @@
 from datetime import datetime as dt
-from dateutil.relativedelta import relativedelta
-from simulation import DataFrameConfig, CustomerConfig, TradingAlgorithm, TradingCondition, Simulator, QueryDataFrame, TradingInfo
-from database import Session, TransactionHistory, HoldingStock, UserDetail
+import datetime
+
 from sqlalchemy.orm import joinedload
+from simulation import DataFrameConfig, CustomerConfig, TradingAlgorithm, TradingCondition, Simulator, QueryDataFrame, TradingInfo
+from database import Session, TransactionHistory, HoldingStock, UserDetail, AssetHistory
+import exchange_calendars as ecals
+
+
+def get_recent_opening_date(date):
+    calendar = ecals.get_calendar('XKRX')
+    while not calendar.is_session(date.strftime('%Y%m%d')):
+        date -= datetime.timedelta(1)
+    return date
 
 
 def get_user_info(user_id):
     with Session() as session:
         user = session.query(UserDetail)\
-            .options(joinedload(UserDetail.transactions))\
             .options(joinedload(UserDetail.holdings))\
+            .options(joinedload(UserDetail.assets))\
             .filter_by(user_id=user_id).first()
     return user
 
@@ -65,7 +74,7 @@ def simulate_future(user_info, sdate, edate):
 def update_user_info(user_info, simulator, date):
     with Session.begin() as session:
         session.query(UserDetail).filter(UserDetail.user_id == user_info.user_id)\
-            .update({'cash': simulator.cash, 'last_updated': date})
+                                 .update({'cash': simulator.cash, 'last_updated': date})
         session.commit()
 
 
@@ -95,38 +104,38 @@ def update_trading_history(user_info, simulator):
 
 def update_holdings(user_info, simulator):
     with Session.begin() as session:
-        holdings = session.query(HoldingStock).filter(HoldingStock.user_id == user_info.user_id)
-        holdings.delete(synchronize_session=False)
-        for holding in simulator.holdings:
-            date = holding['date']
-            isu_srt_cd = holding['code']
-            isu_abbrv = holding['name']
-            quantity = int(holding['quantity'])
-            evaluation_price = int(holding['evaluation_price'])
-            holding_stock = HoldingStock(
+        try:
+            holdings = session.query(HoldingStock).filter(HoldingStock.user_id == user_info.user_id)
+            holdings.delete(synchronize_session=False)
+            for holding in simulator.holdings:
+                date = holding['date']
+                isu_srt_cd = holding['code']
+                isu_abbrv = holding['name']
+                quantity = int(holding['quantity'])
+                evaluation_price = int(holding['evaluation_price'])
+                holding_stock = HoldingStock(
+                    user_id=user_info.user_id,
+                    date=date,
+                    isu_srt_cd=isu_srt_cd,
+                    isu_abbrv=isu_abbrv,
+                    quantity=quantity,
+                    evaluation_price=evaluation_price
+                )
+                session.add(holding_stock)
+            session.commit()
+
+        except Exception as e:
+            session.rollback()
+
+
+def update_asset_change(user_info, simulator):
+    with Session.begin() as session:
+        for date, (total, cash) in zip(simulator.dates, simulator.profits):
+            asset = AssetHistory(
                 user_id=user_info.user_id,
                 date=date,
-                isu_srt_cd=isu_srt_cd,
-                isu_abbrv=isu_abbrv,
-                quantity=quantity,
-                evaluation_price=evaluation_price
+                total=total,
+                cash=cash
             )
-            session.add(holding_stock)
+            session.add(asset)
         session.commit()
-
-
-if __name__ == '__main__':
-    user_id = '김기남3'
-
-    with Session.begin() as session:
-        sdate = session.query(UserDetail).filter(UserDetail.user_id == user_id).first().last_updated
-    months = 1
-    sdate = dt.strftime(sdate, '%Y-%m-%d')
-    edate = dt.strftime(dt.strptime(sdate, '%Y-%m-%d') + relativedelta(months=months), '%Y-%m-%d')
-
-    user_info = get_user_info(user_id)
-    simulator = simulate_future(user_info, sdate, edate)
-
-    update_user_info(user_info, simulator, edate)
-    update_trading_history(user_info, simulator)
-    update_holdings(user_info, simulator)

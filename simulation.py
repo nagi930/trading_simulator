@@ -1,11 +1,24 @@
-import pandas as pd
 import datetime
 from datetime import datetime as dt
-import pprint
-from database import STKDB, Session
-import numpy as np
 from collections.abc import Iterable
+
+import pandas as pd
+import numpy as np
 import sqlalchemy
+from database import STKDB, Session
+
+
+def filter_query(df, algorithm, and_or='&'):
+    comparisons = [condition for condition in algorithm if condition.operator in ('>=', '>', '==', '!=', '<=', '<')]
+    if comparisons:
+        df = df.query(f'{and_or}'.join(map(repr, comparisons)))
+    sorts = [condition for condition in algorithm if condition.operator == 'sort']
+    if sorts:
+        df = df.sort_values(
+            by=[condition.column for condition in sorts],
+            ascending=[condition.value for condition in sorts]
+        )
+    return df
 
 
 class DataFrameConfig:
@@ -14,6 +27,21 @@ class DataFrameConfig:
         self.sector = sector
         self.start = start
         self.end = end
+        self.df = None
+
+    def get_dataframe(self):
+        with Session() as session:
+            query = session.query(STKDB)
+            query = query.filter((self.start <= STKDB.open_date) &
+                                 (STKDB.open_date < self.end))
+            if self.market != 'ALL':
+                query = query.filter(STKDB.mkt_nm.like(f'%{self.market}%'))
+            if self.sector != 'ALL' and isinstance(self.sector, Iterable):
+                query = query.filter(sqlalchemy.func.REGEXP_LIKE(STKDB.std_ind_cd, '|'.join(map(lambda x: f'..{x}..', self.sector))))
+            df = pd.read_sql(query.statement, query.session.bind)
+            df.columns = [column.upper() for column in df.columns]
+            self.df = df.set_index('OPEN_DATE')
+        return self.df
 
 
 class CustomerConfig:
@@ -23,16 +51,6 @@ class CustomerConfig:
         self.max_hold_count = max_hold_count
         self.take_profit = take_profit
         self.cut_loss = cut_loss
-
-
-def filter_query(df, algorithm, and_or='&'):
-    comparisons = [condition for condition in algorithm if condition.operator in ('>=', '>', '==', '!=', '<=', '<')]
-    if comparisons:
-        df = df.query(f'{and_or}'.join(map(repr, comparisons)))
-    sorts = [condition for condition in algorithm if condition.operator == 'sort']
-    if sorts:
-        df = df.sort_values(by=[condition.column for condition in sorts], ascending=[condition.value for condition in sorts])
-    return df
 
 
 class TradingAlgorithm(list):
@@ -52,6 +70,9 @@ class TradingCondition:
     def __str__(self):
         return f'{self.column} {self.operator} {self.value}'
 
+    def __repr__(self):
+        return f'({self.column} {self.operator} {self.value})'
+
 
 class Simulator:
     def __init__(self, dataframe, customer_config, sell_algorithm, buy_algorithm, init_holdings=None):
@@ -64,7 +85,7 @@ class Simulator:
         self.cash = customer_config.cash
         self._holdings = init_holdings or []
         self.dates = [pd.to_datetime(str(date)).strftime('%Y-%m-%d') for date in dataframe.index.unique()]
-        self.clsprc = self.dataframe.groupby(['OPEN_DATE', 'ISU_SRT_CD'])['TDD_CLSPRC'].sum().unstack()
+        self.clsprc = self.dataframe.groupby(['OPEN_DATE', 'ISU_SRT_CD'])['TDD_CLSPRC'].mean().unstack()
         self.clsprc.index = self.clsprc.index.strftime("%Y-%m-%d")
 
     @property
@@ -101,7 +122,14 @@ class Simulator:
 
     def cut_trade(self, date):
         for stock in self._holdings[:]:
-            clsprc = self.clsprc.at[date, stock.code]
+            try:
+                clsprc = self.clsprc.at[date, stock.code]
+            except KeyError:
+                clsprc = stock.evaluation_price
+                self.cash += (clsprc * stock.quantity)
+                self._result[date].append(TradingInfo(date, stock.code, stock.name, stock.quantity, stock.evaluation_price, clsprc))
+                self._holdings.remove(stock)
+                continue
             if (clsprc >= stock.evaluation_price * (self.customer_config.take_profit + 100) / 100)\
                 or (clsprc <= stock.evaluation_price * (100 - self.customer_config.cut_loss) / 100)\
                     or (dt.strptime(stock.date, '%Y-%m-%d') + datetime.timedelta(self.customer_config.min_hold_period) <= dt.strptime(date, '%Y-%m-%d')):
@@ -110,7 +138,7 @@ class Simulator:
                 self.cash += (clsprc * stock.quantity)
                 self._result[date].append(TradingInfo(date, stock.code, stock.name, stock.quantity, stock.evaluation_price, clsprc))
                 self._holdings.remove(stock)
-                break
+                continue
 
     def trade(self, date, sells, buys):
         if self.sell_algorithm:
@@ -138,25 +166,6 @@ class Simulator:
                     break
             else:
                 self._holdings.append(TradingInfo(date, code, name, quantity, price, None))
-
-
-class QueryDataFrame:
-    def __init__(self, dataframe_config):
-        self.dataframe_config = dataframe_config
-
-    def get_dataframe(self):
-        with Session() as session:
-            query = session.query(STKDB)
-            query = query.filter((self.dataframe_config.start <= STKDB.open_date) &
-                                 (STKDB.open_date < self.dataframe_config.end))
-            if self.dataframe_config.market != 'ALL':
-                query = query.filter(STKDB.mkt_nm.like(f'%{self.dataframe_config.market}%'))
-            if self.dataframe_config.sector != 'ALL' and isinstance(self.dataframe_config.sector, Iterable):
-                query = query.filter(sqlalchemy.func.REGEXP_LIKE(STKDB.std_ind_cd, '|'.join(map(lambda x: f'..{x}..', self.dataframe_config.sector))))
-            df = pd.read_sql(query.statement, query.session.bind)
-            df.columns = [column.upper() for column in df.columns]
-            df = df.set_index('OPEN_DATE')
-        return df
 
 
 class TradingInfo:
@@ -190,10 +199,11 @@ class TradingInfo:
         return f'종목코드: {self.code} 종목명: {self.name} 수량: {self.quantity} 매수가: {self.buy_price} ' \
                f'평가가: {self.evaluation_price} 매도가: {self.sell_price}'
 
+
 if __name__ == '__main__':
     dataframe_config = DataFrameConfig('ALL', 'ALL', '20200701', '20210701')
-    df = QueryDataFrame(dataframe_config).get_dataframe()
-    print(df)
+    df = dataframe_config.get_dataframe()
+
     customer_config = CustomerConfig(10000000, 10, 10, 7, 5)
 
     buy_algorithm = TradingAlgorithm()
@@ -204,12 +214,9 @@ if __name__ == '__main__':
     sell_algorithm = TradingAlgorithm()
     sell_algorithm.append(TradingCondition('RSI_6', '>=', 80))
 
-
     simulator = Simulator(dataframe=df, customer_config=customer_config,
-                            sell_algorithm=sell_algorithm, buy_algorithm=buy_algorithm)
+                          sell_algorithm=sell_algorithm, buy_algorithm=buy_algorithm)
     simulator.run()
-    pprint.pprint(simulator.result)
-    print(simulator.profits)
 
 
 

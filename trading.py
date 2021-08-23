@@ -2,7 +2,7 @@ from datetime import datetime as dt
 import datetime
 
 from sqlalchemy.orm import joinedload
-from simulation import DataFrameConfig, CustomerConfig, TradingAlgorithm, TradingCondition, Simulator, QueryDataFrame, TradingInfo
+from simulation import DataFrameConfig, UserConfig, TradingAlgorithm, TradingCondition, Simulator, TradingInfo
 from database import Session, TransactionHistory, HoldingStock, UserDetail, AssetHistory
 import exchange_calendars as ecals
 
@@ -25,18 +25,17 @@ def get_user_info(user_id):
 
 def simulate_future(user_info, sdate, edate):
     dataframe_config = DataFrameConfig(user_info.market, user_info.sector, sdate, edate)
-    df = QueryDataFrame(dataframe_config).get_dataframe()
+    df = dataframe_config.set_dataframe()
 
     holdings = [TradingInfo(
         date=dt.strftime(holding.date, '%Y-%m-%d'),
         code=holding.isu_srt_cd,
         name=holding.isu_abbrv,
         quantity=holding.quantity,
-        buy_price=holding.evaluation_price,
-        sell_price=None
+        buy_price=holding.evaluation_price
     ) for holding in user_info.holdings]
 
-    cc = CustomerConfig(
+    uc = UserConfig(
         cash=user_info.cash,
         take_profit=user_info.take_profit,
         cut_loss=user_info.cut_loss,
@@ -61,8 +60,8 @@ def simulate_future(user_info, sdate, edate):
             sell_algorithm.append(TradingCondition(column, operator, value))
 
     simulator = Simulator(
-        dataframe=df,
-        customer_config=cc,
+        df=df,
+        user_config=uc,
         sell_algorithm=sell_algorithm,
         buy_algorithm=buy_algorithm,
         init_holdings=holdings
